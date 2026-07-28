@@ -2,15 +2,14 @@
 
 import {
   BadgeCheck,
-  Bot,
   Carrot,
   CircleAlert,
   Clock3,
   Coins,
+  Cpu,
   FileCheck2,
   Fingerprint,
   History,
-  Leaf,
   ListChecks,
   LoaderCircle,
   LockKeyhole,
@@ -23,7 +22,7 @@ import {
   Users,
   Wheat,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8010";
@@ -86,6 +85,8 @@ type Action = {
   cropName: string | null;
   quantity: number;
   source: string;
+  executionMode: "LLM" | "RULES";
+  agentRunId: string | null;
   isIncoming: boolean;
   createdAt: string;
 };
@@ -101,6 +102,27 @@ type Dashboard = {
     automationEnabled: boolean;
     lastRunAt: string | null;
   };
+  runtime: {
+    mode: "llm" | "rules";
+    provider: string;
+    model: string;
+    configured: boolean;
+    maxToolRounds: number;
+  };
+  recentRuns: Array<{
+    id: string;
+    triggerSource: string;
+    runtimeMode: "LLM" | "RULES";
+    provider: string;
+    model: string;
+    status: string;
+    credentialStatus: CredentialStatus;
+    toolCallCount: number;
+    decisionSummary: string;
+    errorMessage: string;
+    startedAt: string;
+    completedAt: string | null;
+  }>;
   credential: null | {
     provider: string;
     templateId: string;
@@ -143,6 +165,8 @@ const actionLabels: Record<string, string> = {
   HARVEST: "收获",
   STEAL: "邻居采摘",
   OBSERVE: "巡田",
+  MODEL_DECISION: "模型决策",
+  AGENT_ERROR: "模型运行异常",
 };
 
 const stepLabels: Record<string, string> = {
@@ -280,7 +304,16 @@ function ActionIcon({ type }: { type: string }) {
   if (type === "HARVEST") return <Wheat size={17} />;
   if (type === "STEAL") return <Carrot size={17} />;
   if (type === "ACCESS") return <LockKeyhole size={17} />;
+  if (type === "MODEL_DECISION") return <Cpu size={17} />;
+  if (type === "AGENT_ERROR") return <CircleAlert size={17} />;
   return <History size={17} />;
+}
+
+function actionResultLabel(status: string) {
+  if (status === "SUCCESS") return "已完成";
+  if (status === "BLOCKED") return "已拦截";
+  if (status === "REJECTED") return "已拒绝";
+  return "执行失败";
 }
 
 export default function FarmDemo() {
@@ -291,6 +324,13 @@ export default function FarmDemo() {
   const [actionFilter, setActionFilter] = useState<ActionFilter>("all");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const selectedOwnerRef = useRef(selectedOwnerId);
+  const dashboardRequestRef = useRef<{
+    controller: AbortController;
+    ownerId: string;
+    requestId: number;
+  } | null>(null);
+  const dashboardRequestIdRef = useRef(0);
 
   const loadOwners = useCallback(async () => {
     const data = await api<OwnerSummary[]>("/api/owners");
@@ -298,20 +338,41 @@ export default function FarmDemo() {
   }, []);
 
   const loadDashboard = useCallback(
-    async (quiet = false) => {
+    async (quiet = false, ownerId = selectedOwnerId) => {
+      const activeRequest = dashboardRequestRef.current;
+      if (quiet && activeRequest?.ownerId === ownerId) return;
+      activeRequest?.controller.abort();
+
+      const controller = new AbortController();
+      const requestId = ++dashboardRequestIdRef.current;
+      dashboardRequestRef.current = { controller, ownerId, requestId };
       try {
         const data = await api<Dashboard>(
-          `/api/owners/${selectedOwnerId}/dashboard`,
+          `/api/owners/${ownerId}/dashboard`,
+          { signal: controller.signal },
         );
-        setDashboard(data);
-        if (!quiet) setError(null);
+        const isCurrent =
+          dashboardRequestRef.current?.requestId === requestId &&
+          selectedOwnerRef.current === ownerId;
+        if (isCurrent) {
+          setDashboard(data);
+          if (!quiet) setError(null);
+        }
       } catch (requestError) {
-        if (!quiet) {
+        if (
+          !controller.signal.aborted &&
+          !quiet &&
+          selectedOwnerRef.current === ownerId
+        ) {
           setError(
             requestError instanceof Error
               ? requestError.message
               : "无法连接后端服务",
           );
+        }
+      } finally {
+        if (dashboardRequestRef.current?.requestId === requestId) {
+          dashboardRequestRef.current = null;
         }
       }
     },
@@ -319,15 +380,36 @@ export default function FarmDemo() {
   );
 
   useEffect(() => {
-    loadOwners().catch(() => setError("无法读取演示账号"));
+    const initialLoad = window.setTimeout(() => {
+      void loadOwners().catch(() => setError("无法读取演示账号"));
+    }, 0);
+    return () => window.clearTimeout(initialLoad);
   }, [loadOwners]);
 
   useEffect(() => {
-    setDashboard(null);
-    loadDashboard();
+    const initialLoad = window.setTimeout(() => {
+      void loadDashboard();
+    }, 0);
     const timer = window.setInterval(() => loadDashboard(true), 2000);
-    return () => window.clearInterval(timer);
-  }, [loadDashboard]);
+    return () => {
+      window.clearTimeout(initialLoad);
+      window.clearInterval(timer);
+      if (dashboardRequestRef.current?.ownerId === selectedOwnerId) {
+        dashboardRequestRef.current.controller.abort();
+        dashboardRequestRef.current = null;
+      }
+    };
+  }, [loadDashboard, selectedOwnerId]);
+
+  const selectOwner = (ownerId: string) => {
+    dashboardRequestRef.current?.controller.abort();
+    dashboardRequestRef.current = null;
+    dashboardRequestIdRef.current += 1;
+    selectedOwnerRef.current = ownerId;
+    setSelectedOwnerId(ownerId);
+    setDashboard((current) => (current?.owner.id === ownerId ? current : null));
+    setError(null);
+  };
 
   const mutate = async (
     key: string,
@@ -338,7 +420,10 @@ export default function FarmDemo() {
     setError(null);
     try {
       await api(path, init);
-      await Promise.all([loadDashboard(), loadOwners()]);
+      await Promise.all([
+        loadDashboard(false, selectedOwnerRef.current),
+        loadOwners(),
+      ]);
     } catch (requestError) {
       setError(
         requestError instanceof Error ? requestError.message : "操作失败",
@@ -362,13 +447,19 @@ export default function FarmDemo() {
     return dashboard.actions;
   }, [dashboard, actionFilter]);
 
+  const latestOutgoingAction = useMemo(
+    () => dashboard?.actions.find((action) => !action.isIncoming),
+    [dashboard],
+  );
+
   const resetDemo = async () => {
     setBusy("reset");
     try {
       await api("/api/demo/reset", { method: "POST" });
+      selectedOwnerRef.current = "owner-lin";
       setSelectedOwnerId("owner-lin");
       setActiveTab("farm");
-      await Promise.all([loadOwners(), loadDashboard()]);
+      await Promise.all([loadOwners(), loadDashboard(false, "owner-lin")]);
     } catch (requestError) {
       setError(
         requestError instanceof Error ? requestError.message : "重置失败",
@@ -396,7 +487,7 @@ export default function FarmDemo() {
             <button
               className={owner.id === selectedOwnerId ? "selected" : ""}
               key={owner.id}
-              onClick={() => setSelectedOwnerId(owner.id)}
+              onClick={() => selectOwner(owner.id)}
               type="button"
             >
               <AgentAvatar
@@ -539,18 +630,55 @@ export default function FarmDemo() {
                   </span>
                 </div>
                 <div className="strategy-order">
-                  <div>
-                    <strong>01</strong>
-                    <span>收获成熟作物</span>
+                  <div className="runtime-state">
+                    <Cpu size={16} />
+                    <div>
+                      <strong>
+                        {dashboard.runtime.mode === "llm"
+                          ? "模型 Skill 模式"
+                          : "确定性规则模式"}
+                      </strong>
+                      <span>
+                        {dashboard.runtime.mode === "llm"
+                          ? `${dashboard.runtime.provider} · ${dashboard.runtime.model}`
+                          : "不调用外部模型 API"}
+                      </span>
+                    </div>
+                    {!dashboard.runtime.configured && (
+                      <small>等待 API Key</small>
+                    )}
                   </div>
-                  <div>
-                    <strong>02</strong>
-                    <span>补种空闲地块</span>
-                  </div>
-                  <div>
-                    <strong>03</strong>
-                    <span>寻找邻居成熟作物</span>
-                  </div>
+                  {dashboard.runtime.mode === "llm" ? (
+                    <>
+                      <div>
+                        <strong>01</strong>
+                        <span>观察农场、邻居与近期行为</span>
+                      </div>
+                      <div>
+                        <strong>02</strong>
+                        <span>调用受限种植与收获 Skills</span>
+                      </div>
+                      <div>
+                        <strong>03</strong>
+                        <span>按额度完成一次社交采摘</span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <strong>01</strong>
+                        <span>收获成熟作物</span>
+                      </div>
+                      <div>
+                        <strong>02</strong>
+                        <span>补种空闲地块</span>
+                      </div>
+                      <div>
+                        <strong>03</strong>
+                        <span>寻找邻居成熟作物</span>
+                      </div>
+                    </>
+                  )}
                 </div>
                 <div className="console-actions">
                   <button
@@ -595,25 +723,25 @@ export default function FarmDemo() {
                 </div>
                 <div className="latest-action">
                   <span>最新决策</span>
-                  {dashboard.actions.find((action) => !action.isIncoming) ? (
+                  {latestOutgoingAction ? (
                     <>
                       <strong>
-                        {actionLabels[
-                          dashboard.actions.find(
-                            (action) => !action.isIncoming,
-                          )!.actionType
-                        ] ?? "状态检查"}
+                        {actionLabels[latestOutgoingAction.actionType] ??
+                          "状态检查"}
                       </strong>
-                      <p>
-                        {
-                          dashboard.actions.find(
-                            (action) => !action.isIncoming,
-                          )!.reason
-                        }
-                      </p>
+                      <p>{latestOutgoingAction.reason}</p>
                     </>
                   ) : (
                     <p>等待智能体首次运行</p>
+                  )}
+                  {dashboard.recentRuns[0] && (
+                    <small className="latest-run-summary">
+                      {dashboard.recentRuns[0].runtimeMode === "LLM"
+                        ? `${dashboard.recentRuns[0].provider} · ${dashboard.recentRuns[0].model}`
+                        : "本地规则"}
+                      {" · "}
+                      {dashboard.recentRuns[0].toolCallCount} 次 Skill 调用
+                    </small>
                   )}
                 </div>
               </aside>
@@ -849,7 +977,7 @@ export default function FarmDemo() {
                   filteredActions.map((action) => (
                     <article
                       className={`action-row ${
-                        action.status === "BLOCKED" ? "action-blocked" : ""
+                        action.status !== "SUCCESS" ? "action-blocked" : ""
                       }`}
                       key={action.id}
                     >
@@ -879,18 +1007,23 @@ export default function FarmDemo() {
                       <div>
                         <span className="mobile-label">凭证校验</span>
                         <CredentialBadge status={action.credentialStatus} />
+                        <span
+                          className={`source-chip source-${action.executionMode.toLowerCase()}`}
+                        >
+                          {action.executionMode === "LLM" ? "模型 Skill" : "规则引擎"}
+                        </span>
                         <small>{action.reason}</small>
                       </div>
                       <div>
                         <span className="mobile-label">结果</span>
                         <strong
                           className={
-                            action.status === "BLOCKED"
-                              ? "result-blocked"
-                              : "result-success"
+                            action.status === "SUCCESS"
+                              ? "result-success"
+                              : "result-blocked"
                           }
                         >
-                          {action.status === "BLOCKED" ? "已拦截" : "已完成"}
+                          {actionResultLabel(action.status)}
                         </strong>
                         <small>{action.traceId}</small>
                       </div>

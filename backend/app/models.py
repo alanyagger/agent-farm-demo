@@ -150,3 +150,22 @@ class AgentAction(Base):
     before_state: Mapped[str] = mapped_column(Text, default="")
     after_state: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    trigger_source: Mapped[str] = mapped_column(String(24))
+    runtime_mode: Mapped[str] = mapped_column(String(16))
+    provider: Mapped[str] = mapped_column(String(48), default="rules")
+    model_name: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(24), default="RUNNING")
+    credential_status: Mapped[str] = mapped_column(String(24), default="UNKNOWN")
+    tool_call_count: Mapped[int] = mapped_column(Integer, default=0)
+    action_trace_ids: Mapped[str] = mapped_column(Text, default="[]")
+    decision_summary: Mapped[str] = mapped_column(Text, default="")
+    error_message: Mapped[str] = mapped_column(String(320), default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

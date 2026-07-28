@@ -5,7 +5,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .game import CROPS, serialize_crop_stage
-from .models import Agent, AgentAction, Farm, Owner, utcnow
+from .model_provider import runtime_descriptor
+from .models import Agent, AgentAction, AgentRun, Farm, Owner, utcnow
 
 
 def iso(value: datetime | None) -> str | None:
@@ -69,6 +70,7 @@ def serialize_action(action: AgentAction, owner_id: str, db: Session) -> dict:
     is_incoming = (
         action.target_owner_id == owner_id and action.actor_owner_id != owner_id
     )
+    after_state = json.loads(action.after_state or "{}")
     return {
         "id": action.id,
         "traceId": action.trace_id,
@@ -84,9 +86,11 @@ def serialize_action(action: AgentAction, owner_id: str, db: Session) -> dict:
         "cropName": CROPS.get(action.crop_type or "", {}).get("name"),
         "quantity": action.quantity,
         "source": action.source,
+        "executionMode": "LLM" if action.source.startswith("LLM_") else "RULES",
         "isIncoming": is_incoming,
         "beforeState": json.loads(action.before_state or "{}"),
-        "afterState": json.loads(action.after_state or "{}"),
+        "afterState": after_state,
+        "agentRunId": after_state.get("agentRunId"),
         "createdAt": iso(action.created_at),
     }
 
@@ -128,6 +132,12 @@ def dashboard(db: Session, owner_id: str) -> dict | None:
         .limit(120)
     ).all()
     events = sorted(agent.credential_events, key=lambda event: event.created_at)
+    runs = db.scalars(
+        select(AgentRun)
+        .where(AgentRun.agent_id == agent.id)
+        .order_by(AgentRun.started_at.desc())
+        .limit(12)
+    ).all()
 
     return {
         "owner": serialize_owner(owner),
@@ -140,6 +150,24 @@ def dashboard(db: Session, owner_id: str) -> dict | None:
             "automationEnabled": agent.automation_enabled,
             "lastRunAt": iso(agent.last_run_at),
         },
+        "runtime": runtime_descriptor(),
+        "recentRuns": [
+            {
+                "id": run.id,
+                "triggerSource": run.trigger_source,
+                "runtimeMode": run.runtime_mode,
+                "provider": run.provider,
+                "model": run.model_name,
+                "status": run.status,
+                "credentialStatus": run.credential_status,
+                "toolCallCount": run.tool_call_count,
+                "decisionSummary": run.decision_summary,
+                "errorMessage": run.error_message,
+                "startedAt": iso(run.started_at),
+                "completedAt": iso(run.completed_at),
+            }
+            for run in runs
+        ],
         "credential": (
             {
                 "provider": credential.provider,

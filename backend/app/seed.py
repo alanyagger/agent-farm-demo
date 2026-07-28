@@ -8,6 +8,7 @@ from .models import (
     Agent,
     AgentAction,
     AgentCredential,
+    AgentRun,
     CredentialEvent,
     Farm,
     Inventory,
@@ -49,7 +50,7 @@ OWNERS = [
         "agent_id": "agent-nova",
         "agent_name": "田小诺",
         "claw_id": "claw-farm-nova",
-        "description": "偏好先完成身份校验，再参与农场协作。",
+        "description": "完成身份校验后才能再次参与农场协作。",
     },
 ]
 
@@ -60,6 +61,7 @@ def _phone_hash(masked_phone: str) -> str:
 
 def reset_demo(db: Session) -> None:
     for model in (
+        AgentRun,
         AgentAction,
         CredentialEvent,
         Inventory,

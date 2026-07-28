@@ -2,7 +2,7 @@
 
 一个用于演示“智能体身份可归属、无有效凭证不能执行、行为全程可追溯”的单机 Web Demo。
 
-项目预置三组主人、智能体和农场。两个智能体持有有效的中移互联网智能体身份模拟凭证，第三个尚未申领。智能体会按规则自动种植、收获和采摘邻居成熟作物，每次行动都会先进行凭证准入校验并生成审计记录。
+项目预置三组主人、智能体和农场。两个智能体持有有效的中移互联网智能体身份模拟凭证，第三个尚未申领。默认使用可离线演示的确定性规则；启用 LLM 模式后，智能体会通过 DeepSeek 和受限农场 Skills 决策种植、收获和社交采摘。每次行动都会先进行凭证准入校验并生成审计记录。
 
 ## 项目结构
 
@@ -37,6 +37,36 @@ npm install
 - 农场 Demo：`http://localhost:3000`
 - FastAPI 文档：`http://127.0.0.1:8010/docs`
 - 健康检查：`http://127.0.0.1:8010/health`
+
+## 启用真实 DeepSeek Agent
+
+默认 `AGENT_RUNTIME_MODE=rules`，因此没有 API Key 时也能稳定演示凭证准入和农场流程。要让“运行一次”和自动调度实际调用 DeepSeek：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+在 `.env` 中填写：
+
+```dotenv
+AGENT_RUNTIME_MODE=llm
+MODEL_PROVIDER=deepseek
+DEEPSEEK_API_KEY=你的服务端DeepSeek密钥
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+```
+
+`deepseek-v4-flash` 适合高频、边界明确的农场工具调用；可把 `DEEPSEEK_MODEL` 改为 `deepseek-v4-pro`。密钥只能保存在后端 `.env`，不要填写 `NEXT_PUBLIC_*` 变量，也不要提交 `.env`。
+
+LLM 模式使用 LangGraph 编排：
+
+```text
+凭证门禁 -> 脱敏农场状态 -> DeepSeek 工具调用 -> 受限 Skill 执行 -> 行为审计
+```
+
+模型只可调用 `inspect_my_farm`、`inspect_neighbors`、`read_recent_actions`、`harvest_crop`、`plant_crop`、`steal_crop`。种植、收获和采摘均会在服务端再次核验凭证、归属、库存、冷却和单轮额度；模型不能访问网络、文件、Shell 或数据库。
+
+DeepSeek 超时、鉴权失败、工具参数错误或超过最大调用轮次时，系统会生成 `AGENT_ERROR` 审计并停止当前轮次，不会静默改用规则引擎。界面的“行为记录”会标记每条行为来自“模型 Skill”还是“规则引擎”。
 
 ## 停止项目
 
@@ -81,6 +111,7 @@ Get-CimInstance Win32_Process |
 3. 规则顺序为：收获一块成熟作物、补种最多两块空地、采摘一块邻居成熟作物。
 4. 同一智能体对邻居采摘有 18 秒冷却时间，且至少为主人保留一份产量。
 5. `PENDING`、`REVOKED`、`EXPIRED`、`REJECTED` 和无凭证状态均生成 `BLOCKED` 审计记录。
+6. LLM 模式中，每轮最多收获 1 次、种植 2 次、社交采摘 1 次；每个写 Skill 会再次核验凭证。
 
 ## 凭证适配器
 
@@ -112,3 +143,4 @@ npm run build
 - [智能体身份凭证流程](docs/02-智能体身份凭证流程.md)
 - [接口适配与风险清单](docs/03-接口适配与风险清单.md)
 - [五分钟演示讲稿](docs/04-五分钟演示讲稿.md)
+- [Skill 驱动真实 Agent 说明](docs/05-Skill驱动真实Agent说明.md)

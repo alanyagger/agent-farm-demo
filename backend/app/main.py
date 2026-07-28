@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -8,10 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from .agent_runtime import AgentRunInProgressError, AgentRuntime
 from .config import settings
 from .credentials import CredentialService
 from .database import Base, SessionLocal, engine, get_db
 from .game import GameEngine
+from .model_provider import runtime_descriptor
 from .models import Agent, Owner
 from .schemas import AutomationRequest, SimulateCredentialStatusRequest
 from .seed import ensure_seeded, reset_demo
@@ -20,23 +23,56 @@ from .serializers import dashboard, serialize_owner
 
 credential_service = CredentialService()
 game_engine = GameEngine(credential_service)
+agent_runtime = AgentRuntime(game_engine)
+logger = logging.getLogger(__name__)
+scheduled_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def _enabled_agent_ids() -> list[str]:
+    with SessionLocal() as db:
+        return list(
+            db.scalars(
+                select(Agent.id)
+                .where(Agent.automation_enabled.is_(True))
+                .order_by(Agent.id)
+            ).all()
+        )
+
+
+def _run_scheduled_agent(agent_id: str) -> None:
+    with SessionLocal() as db:
+        try:
+            agent_runtime.run(db, agent_id, source="SCHEDULER")
+        except AgentRunInProgressError:
+            return
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduled Agent run failed: %s", agent_id)
+
+
+def _forget_scheduled_task(agent_id: str, task: asyncio.Task[None]) -> None:
+    if scheduled_tasks.get(agent_id) is task:
+        scheduled_tasks.pop(agent_id, None)
 
 
 async def scheduler_loop() -> None:
     while True:
         await asyncio.sleep(settings.scheduler_interval_seconds)
-        with SessionLocal() as db:
-            agent_ids = db.scalars(
-                select(Agent.id)
-                .where(Agent.automation_enabled.is_(True))
-                .order_by(Agent.id)
-            ).all()
+        agent_ids = await asyncio.to_thread(_enabled_agent_ids)
         for agent_id in agent_ids:
-            with SessionLocal() as db:
-                try:
-                    game_engine.run_agent(db, agent_id, source="SCHEDULER")
-                except Exception:
-                    db.rollback()
+            current = scheduled_tasks.get(agent_id)
+            if current is not None and not current.done():
+                continue
+            task = asyncio.create_task(
+                asyncio.to_thread(_run_scheduled_agent, agent_id),
+                name=f"agent-scheduler-{agent_id}",
+            )
+            scheduled_tasks[agent_id] = task
+            task.add_done_callback(
+                lambda completed, scheduled_agent_id=agent_id: (
+                    _forget_scheduled_task(scheduled_agent_id, completed)
+                )
+            )
 
 
 @asynccontextmanager
@@ -51,11 +87,17 @@ async def lifespan(_: FastAPI):
         scheduler.cancel()
         with suppress(asyncio.CancelledError):
             await scheduler
+        running_tasks = list(scheduled_tasks.values())
+        for task in running_tasks:
+            task.cancel()
+        if running_tasks:
+            await asyncio.gather(*running_tasks, return_exceptions=True)
+        scheduled_tasks.clear()
 
 
 app = FastAPI(
     title=settings.app_name,
-    version="1.0.0",
+    version="1.1.0",
     description="Credential-gated autonomous farm demo with traceable agent actions.",
     lifespan=lifespan,
 )
@@ -74,6 +116,7 @@ def health() -> dict:
         "status": "ok",
         "provider": credential_service.provider.name,
         "schedulerIntervalSeconds": settings.scheduler_interval_seconds,
+        "agentRuntime": runtime_descriptor(),
     }
 
 
@@ -125,12 +168,21 @@ def run_agent(agent_id: str, db: Session = Depends(get_db)) -> dict:
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     try:
-        actions = game_engine.run_agent(db, agent_id, source="MANUAL")
+        execution = agent_runtime.run(db, agent_id, source="MANUAL")
+    except AgentRunInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
-        "actionCount": len(actions),
-        "traceIds": [action.trace_id for action in actions],
+        "actionCount": len(execution.actions),
+        "traceIds": [action.trace_id for action in execution.actions],
+        "run": {
+            "id": execution.run.id,
+            "status": execution.run.status,
+            "runtimeMode": execution.run.runtime_mode,
+            "provider": execution.run.provider,
+            "model": execution.run.model_name,
+        },
         "dashboard": dashboard(db, agent.owner_id),
     }
 

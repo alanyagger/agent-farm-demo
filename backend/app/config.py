@@ -10,6 +10,16 @@ class Settings(BaseSettings):
     credential_provider: str = "mock"
     allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # The default keeps the offline demo usable. Set this to "llm" to make
+    # every agent turn use the configured external model provider.
+    agent_runtime_mode: str = "rules"
+    model_provider: str = "deepseek"
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_timeout_seconds: float = 20.0
+    agent_max_tool_rounds: int = 4
+
     cmcc_base_url: str = ""
     cmcc_app_id: str = ""
     cmcc_app_key: str = ""
@@ -26,6 +36,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [item.strip() for item in self.allowed_origins.split(",") if item.strip()]
+
+    @property
+    def llm_runtime_enabled(self) -> bool:
+        return self.agent_runtime_mode.lower() == "llm"
 
 
 @lru_cache

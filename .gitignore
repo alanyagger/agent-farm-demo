@@ -45,6 +45,8 @@ next-env.d.ts
 # local demo state and tool caches
 /.venv/
 /data/*.db
+/data/*.db-shm
+/data/*.db-wal
 /.logs/
 /.npm-cache/
 /.pytest_cache/
