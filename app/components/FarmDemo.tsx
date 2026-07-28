@@ -1,0 +1,912 @@
+"use client";
+
+import {
+  BadgeCheck,
+  Bot,
+  Carrot,
+  CircleAlert,
+  Clock3,
+  Coins,
+  FileCheck2,
+  Fingerprint,
+  History,
+  Leaf,
+  ListChecks,
+  LoaderCircle,
+  LockKeyhole,
+  Pause,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+  Sprout,
+  Users,
+  Wheat,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8010";
+
+type CredentialStatus =
+  | "ACTIVE"
+  | "PENDING"
+  | "REVOKED"
+  | "EXPIRED"
+  | "REJECTED"
+  | "MISSING";
+
+type OwnerSummary = {
+  id: string;
+  nickname: string;
+  phoneMasked: string;
+  did: string;
+  accent: string;
+  agent: {
+    id: string;
+    name: string;
+    automationEnabled: boolean;
+    credentialStatus: CredentialStatus;
+  };
+};
+
+type Plot = {
+  id: string;
+  position: number;
+  cropType: "CARROT" | "TOMATO" | "CORN" | null;
+  cropName: string | null;
+  stage: "EMPTY" | "SPROUT" | "LEAF" | "MATURE";
+  progress: number;
+  yieldRemaining: number;
+  yieldTotal: number;
+  maturesAt: string | null;
+};
+
+type Farm = {
+  id: string;
+  name: string;
+  coins: number;
+  plots: Plot[];
+  inventory: Array<{
+    cropType: string;
+    cropName: string;
+    quantity: number;
+  }>;
+};
+
+type Action = {
+  id: number;
+  traceId: string;
+  agentName: string;
+  targetOwnerName: string;
+  actionType: string;
+  status: string;
+  reason: string;
+  credentialStatus: CredentialStatus;
+  cropName: string | null;
+  quantity: number;
+  source: string;
+  isIncoming: boolean;
+  createdAt: string;
+};
+
+type Dashboard = {
+  owner: OwnerSummary;
+  agent: {
+    id: string;
+    name: string;
+    clawId: string;
+    platformName: string;
+    description: string;
+    automationEnabled: boolean;
+    lastRunAt: string | null;
+  };
+  credential: null | {
+    provider: string;
+    templateId: string;
+    aic: string;
+    vcRecordId: string;
+    issueMode: string;
+    status: CredentialStatus;
+    issuedAt: string | null;
+    expiresAt: string | null;
+    lastVerifiedAt: string | null;
+  };
+  credentialEvents: Array<{
+    id: number;
+    step: string;
+    status: string;
+    detail: string;
+    createdAt: string;
+  }>;
+  farm: Farm;
+  neighbors: Array<{ owner: OwnerSummary; farm: Farm }>;
+  actions: Action[];
+  serverTime: string;
+};
+
+type TabKey = "farm" | "neighbors" | "credential" | "actions";
+type ActionFilter = "all" | "outgoing" | "incoming" | "blocked";
+
+const statusLabels: Record<CredentialStatus, string> = {
+  ACTIVE: "凭证有效",
+  PENDING: "签发中",
+  REVOKED: "已吊销",
+  EXPIRED: "已过期",
+  REJECTED: "签发拒绝",
+  MISSING: "未申领",
+};
+
+const actionLabels: Record<string, string> = {
+  ACCESS: "准入校验",
+  PLANT: "种植",
+  HARVEST: "收获",
+  STEAL: "邻居采摘",
+  OBSERVE: "巡田",
+};
+
+const stepLabels: Record<string, string> = {
+  OWNER_DID_VERIFIED: "主人实名 DID",
+  AGENT_CREATED: "创建智能体 AIC",
+  APPLICATION_ACCEPTED: "提交凭证申领",
+  CREDENTIAL_ACTIVE: "身份凭证生效",
+  STATUS_ACTIVE: "凭证恢复有效",
+  STATUS_REVOKED: "凭证已吊销",
+  STATUS_EXPIRED: "凭证已过期",
+  STATUS_PENDING: "凭证转为待签发",
+  STATUS_REJECTED: "凭证签发拒绝",
+};
+
+const tabs: Array<{
+  key: TabKey;
+  label: string;
+  icon: typeof Sprout;
+}> = [
+  { key: "farm", label: "我的农场", icon: Sprout },
+  { key: "neighbors", label: "邻居农场", icon: Users },
+  { key: "credential", label: "智能体身份", icon: BadgeCheck },
+  { key: "actions", label: "行为记录", icon: ListChecks },
+];
+
+function formatTime(value: string | null, includeDate = false) {
+  if (!value) return "尚无记录";
+  const date = new Date(value);
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: includeDate ? "2-digit" : undefined,
+    day: includeDate ? "2-digit" : undefined,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function shortId(value: string) {
+  if (value.length < 23) return value;
+  return `${value.slice(0, 12)}...${value.slice(-6)}`;
+}
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? `请求失败：${response.status}`);
+  }
+  return response.json();
+}
+
+function AgentAvatar({
+  ownerId,
+  label,
+  small = false,
+}: {
+  ownerId: string;
+  label: string;
+  small?: boolean;
+}) {
+  const index =
+    ownerId === "owner-lin" ? 0 : ownerId === "owner-zhou" ? 1 : 2;
+  return (
+    <div
+      aria-label={label}
+      className={`agent-avatar avatar-${index} ${small ? "avatar-small" : ""}`}
+      role="img"
+    />
+  );
+}
+
+function CredentialBadge({ status }: { status: CredentialStatus }) {
+  return (
+    <span className={`status-badge status-${status.toLowerCase()}`}>
+      {status === "ACTIVE" ? <ShieldCheck size={14} /> : <LockKeyhole size={14} />}
+      {statusLabels[status]}
+    </span>
+  );
+}
+
+function CropIcon({ plot, compact = false }: { plot: Plot; compact?: boolean }) {
+  if (!plot.cropType) {
+    return (
+      <div className={`crop-visual crop-empty ${compact ? "crop-compact" : ""}`}>
+        <span />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      aria-label={`${plot.cropName}${plot.stage === "MATURE" ? "成熟" : "生长中"}`}
+      className={`crop-visual crop-${plot.cropType.toLowerCase()} crop-${plot.stage.toLowerCase()} ${
+        compact ? "crop-compact" : ""
+      }`}
+      role="img"
+    />
+  );
+}
+
+function FarmPlot({ plot }: { plot: Plot }) {
+  return (
+    <article className={`farm-plot plot-${plot.stage.toLowerCase()}`}>
+      <div className="plot-topline">
+        <span>地块 {plot.position + 1}</span>
+        <span>{plot.cropName ?? "空地"}</span>
+      </div>
+      <CropIcon plot={plot} />
+      {plot.cropType ? (
+        <>
+          <div className="growth-track" aria-label={`生长进度 ${plot.progress}%`}>
+            <span style={{ width: `${plot.progress}%` }} />
+          </div>
+          <div className="plot-meta">
+            <span>{plot.stage === "MATURE" ? "可收获" : `${plot.progress}%`}</span>
+            <span>余量 {plot.yieldRemaining}</span>
+          </div>
+        </>
+      ) : (
+        <div className="plot-empty-label">等待智能体补种</div>
+      )}
+    </article>
+  );
+}
+
+function ActionIcon({ type }: { type: string }) {
+  if (type === "PLANT") return <Sprout size={17} />;
+  if (type === "HARVEST") return <Wheat size={17} />;
+  if (type === "STEAL") return <Carrot size={17} />;
+  if (type === "ACCESS") return <LockKeyhole size={17} />;
+  return <History size={17} />;
+}
+
+export default function FarmDemo() {
+  const [owners, setOwners] = useState<OwnerSummary[]>([]);
+  const [selectedOwnerId, setSelectedOwnerId] = useState("owner-lin");
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [activeTab, setActiveTab] = useState<TabKey>("farm");
+  const [actionFilter, setActionFilter] = useState<ActionFilter>("all");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadOwners = useCallback(async () => {
+    const data = await api<OwnerSummary[]>("/api/owners");
+    setOwners(data);
+  }, []);
+
+  const loadDashboard = useCallback(
+    async (quiet = false) => {
+      try {
+        const data = await api<Dashboard>(
+          `/api/owners/${selectedOwnerId}/dashboard`,
+        );
+        setDashboard(data);
+        if (!quiet) setError(null);
+      } catch (requestError) {
+        if (!quiet) {
+          setError(
+            requestError instanceof Error
+              ? requestError.message
+              : "无法连接后端服务",
+          );
+        }
+      }
+    },
+    [selectedOwnerId],
+  );
+
+  useEffect(() => {
+    loadOwners().catch(() => setError("无法读取演示账号"));
+  }, [loadOwners]);
+
+  useEffect(() => {
+    setDashboard(null);
+    loadDashboard();
+    const timer = window.setInterval(() => loadDashboard(true), 2000);
+    return () => window.clearInterval(timer);
+  }, [loadDashboard]);
+
+  const mutate = async (
+    key: string,
+    path: string,
+    init: RequestInit = { method: "POST" },
+  ) => {
+    setBusy(key);
+    setError(null);
+    try {
+      await api(path, init);
+      await Promise.all([loadDashboard(), loadOwners()]);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "操作失败",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const filteredActions = useMemo(() => {
+    if (!dashboard) return [];
+    if (actionFilter === "incoming") {
+      return dashboard.actions.filter((action) => action.isIncoming);
+    }
+    if (actionFilter === "outgoing") {
+      return dashboard.actions.filter((action) => !action.isIncoming);
+    }
+    if (actionFilter === "blocked") {
+      return dashboard.actions.filter((action) => action.status === "BLOCKED");
+    }
+    return dashboard.actions;
+  }, [dashboard, actionFilter]);
+
+  const resetDemo = async () => {
+    setBusy("reset");
+    try {
+      await api("/api/demo/reset", { method: "POST" });
+      setSelectedOwnerId("owner-lin");
+      setActiveTab("farm");
+      await Promise.all([loadOwners(), loadDashboard()]);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "重置失败",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <main className="app-shell">
+      <header className="app-header">
+        <div className="brand-block">
+          <div className="brand-mark">
+            <Sprout size={22} />
+          </div>
+          <div>
+            <h1>智耕凭证农场</h1>
+            <p>中移互联网智能体身份凭证 Demo</p>
+          </div>
+        </div>
+
+        <div className="owner-switcher" aria-label="切换演示主人">
+          {owners.map((owner) => (
+            <button
+              className={owner.id === selectedOwnerId ? "selected" : ""}
+              key={owner.id}
+              onClick={() => setSelectedOwnerId(owner.id)}
+              type="button"
+            >
+              <AgentAvatar
+                label={`${owner.agent.name}头像`}
+                ownerId={owner.id}
+                small
+              />
+              <span>
+                <strong>{owner.nickname}</strong>
+                <small>{owner.agent.name}</small>
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <button
+          aria-label="重置演示数据"
+          className="icon-button"
+          disabled={busy === "reset"}
+          onClick={resetDemo}
+          title="重置演示数据"
+          type="button"
+        >
+          {busy === "reset" ? (
+            <LoaderCircle className="spin" size={19} />
+          ) : (
+            <RotateCcw size={19} />
+          )}
+        </button>
+      </header>
+
+      <nav className="tab-bar" aria-label="主功能">
+        {tabs.map(({ key, label, icon: Icon }) => (
+          <button
+            aria-current={activeTab === key ? "page" : undefined}
+            className={activeTab === key ? "active" : ""}
+            key={key}
+            onClick={() => setActiveTab(key)}
+            type="button"
+          >
+            <Icon size={18} />
+            <span>{label}</span>
+          </button>
+        ))}
+      </nav>
+
+      {error && (
+        <div className="error-banner" role="alert">
+          <CircleAlert size={18} />
+          <span>{error}</span>
+          <button onClick={() => loadDashboard()} type="button">
+            <RefreshCw size={16} />
+            重试
+          </button>
+        </div>
+      )}
+
+      {!dashboard ? (
+        <section className="loading-state">
+          <LoaderCircle className="spin" size={28} />
+          <span>正在读取可信农场状态</span>
+        </section>
+      ) : (
+        <>
+          <section className="identity-strip">
+            <div className="agent-summary">
+              <AgentAvatar
+                label={`${dashboard.agent.name}头像`}
+                ownerId={dashboard.owner.id}
+              />
+              <div>
+                <div className="agent-title-row">
+                  <h2>{dashboard.agent.name}</h2>
+                  <CredentialBadge
+                    status={dashboard.credential?.status ?? "MISSING"}
+                  />
+                </div>
+                <p>{dashboard.agent.description}</p>
+              </div>
+            </div>
+            <div className="identity-metrics">
+              <div>
+                <Fingerprint size={17} />
+                <span>AIC</span>
+                <strong>
+                  {dashboard.credential
+                    ? shortId(dashboard.credential.aic)
+                    : "等待申领"}
+                </strong>
+              </div>
+              <div>
+                <Clock3 size={17} />
+                <span>最近执行</span>
+                <strong>{formatTime(dashboard.agent.lastRunAt)}</strong>
+              </div>
+              <div>
+                <Coins size={17} />
+                <span>农场资产</span>
+                <strong>{dashboard.farm.coins}</strong>
+              </div>
+            </div>
+          </section>
+
+          {activeTab === "farm" && (
+            <section className="farm-view">
+              <div className="farm-scene">
+                <div className="farm-scene-heading">
+                  <div>
+                    <span className="section-kicker">MY TRUSTED FARM</span>
+                    <h2>{dashboard.farm.name}</h2>
+                  </div>
+                  <div className="inventory-list">
+                    {dashboard.farm.inventory.map((item) => (
+                      <span key={item.cropType}>
+                        {item.cropName}
+                        <strong>{item.quantity}</strong>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="farm-grid">
+                  {dashboard.farm.plots.map((plot) => (
+                    <FarmPlot key={plot.id} plot={plot} />
+                  ))}
+                </div>
+              </div>
+
+              <aside className="agent-console">
+                <div className="console-heading">
+                  <div>
+                    <span className="section-kicker">AGENT CONSOLE</span>
+                    <h3>自主运行</h3>
+                  </div>
+                  <span
+                    className={`live-dot ${
+                      dashboard.agent.automationEnabled ? "is-live" : ""
+                    }`}
+                  >
+                    {dashboard.agent.automationEnabled ? "运行中" : "已暂停"}
+                  </span>
+                </div>
+                <div className="strategy-order">
+                  <div>
+                    <strong>01</strong>
+                    <span>收获成熟作物</span>
+                  </div>
+                  <div>
+                    <strong>02</strong>
+                    <span>补种空闲地块</span>
+                  </div>
+                  <div>
+                    <strong>03</strong>
+                    <span>寻找邻居成熟作物</span>
+                  </div>
+                </div>
+                <div className="console-actions">
+                  <button
+                    className="primary-button"
+                    disabled={busy === "run"}
+                    onClick={() =>
+                      mutate("run", `/api/agents/${dashboard.agent.id}/run`)
+                    }
+                    type="button"
+                  >
+                    {busy === "run" ? (
+                      <LoaderCircle className="spin" size={17} />
+                    ) : (
+                      <Play size={17} />
+                    )}
+                    运行一次
+                  </button>
+                  <button
+                    className="secondary-button"
+                    disabled={busy === "automation"}
+                    onClick={() =>
+                      mutate(
+                        "automation",
+                        `/api/agents/${dashboard.agent.id}/automation`,
+                        {
+                          method: "PATCH",
+                          body: JSON.stringify({
+                            enabled: !dashboard.agent.automationEnabled,
+                          }),
+                        },
+                      )
+                    }
+                    type="button"
+                  >
+                    {dashboard.agent.automationEnabled ? (
+                      <Pause size={17} />
+                    ) : (
+                      <Play size={17} />
+                    )}
+                    {dashboard.agent.automationEnabled ? "暂停" : "自动运行"}
+                  </button>
+                </div>
+                <div className="latest-action">
+                  <span>最新决策</span>
+                  {dashboard.actions.find((action) => !action.isIncoming) ? (
+                    <>
+                      <strong>
+                        {actionLabels[
+                          dashboard.actions.find(
+                            (action) => !action.isIncoming,
+                          )!.actionType
+                        ] ?? "状态检查"}
+                      </strong>
+                      <p>
+                        {
+                          dashboard.actions.find(
+                            (action) => !action.isIncoming,
+                          )!.reason
+                        }
+                      </p>
+                    </>
+                  ) : (
+                    <p>等待智能体首次运行</p>
+                  )}
+                </div>
+              </aside>
+            </section>
+          )}
+
+          {activeTab === "neighbors" && (
+            <section className="content-view">
+              <div className="view-heading">
+                <div>
+                  <span className="section-kicker">SOCIAL FARMS</span>
+                  <h2>邻居农场</h2>
+                </div>
+                <p>成熟作物将进入智能体的社交采摘候选集。</p>
+              </div>
+              <div className="neighbor-list">
+                {dashboard.neighbors.map(({ owner, farm }) => {
+                  const matureCount = farm.plots.filter(
+                    (plot) => plot.stage === "MATURE" && plot.yieldRemaining > 1,
+                  ).length;
+                  return (
+                    <article className="neighbor-row" key={owner.id}>
+                      <div className="neighbor-owner">
+                        <AgentAvatar
+                          label={`${owner.agent.name}头像`}
+                          ownerId={owner.id}
+                        />
+                        <div>
+                          <h3>{farm.name}</h3>
+                          <p>
+                            主人 {owner.nickname} · 智能体 {owner.agent.name}
+                          </p>
+                        </div>
+                        <CredentialBadge
+                          status={owner.agent.credentialStatus}
+                        />
+                      </div>
+                      <div className="neighbor-plots">
+                        {farm.plots.map((plot) => (
+                          <div className="mini-plot" key={plot.id}>
+                            <CropIcon compact plot={plot} />
+                            <span>{plot.cropName ?? "空地"}</span>
+                            <small>
+                              {plot.stage === "MATURE"
+                                ? `成熟 · ${plot.yieldRemaining}`
+                                : `${plot.progress}%`}
+                            </small>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="neighbor-ready">
+                        <span>可采摘地块</span>
+                        <strong>{matureCount}</strong>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          {activeTab === "credential" && (
+            <section className="credential-view">
+              <div className="credential-identity">
+                <div className="view-heading">
+                  <div>
+                    <span className="section-kicker">CREDENTIAL IDENTITY</span>
+                    <h2>智能体身份凭证</h2>
+                  </div>
+                  <CredentialBadge
+                    status={dashboard.credential?.status ?? "MISSING"}
+                  />
+                </div>
+
+                <div className="identity-fields">
+                  <div>
+                    <span>主人实名 DID</span>
+                    <strong>{dashboard.owner.did}</strong>
+                  </div>
+                  <div>
+                    <span>智能体 AIC</span>
+                    <strong>
+                      {dashboard.credential?.aic ?? "尚未创建"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>凭证记录 ID</span>
+                    <strong>
+                      {dashboard.credential?.vcRecordId ?? "尚未签发"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>有效期</span>
+                    <strong>
+                      {dashboard.credential?.expiresAt
+                        ? formatTime(dashboard.credential.expiresAt, true)
+                        : "尚未生成"}
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="credential-actions">
+                  {!dashboard.credential ? (
+                    <button
+                      className="primary-button"
+                      disabled={busy === "apply"}
+                      onClick={() =>
+                        mutate(
+                          "apply",
+                          `/api/owners/${dashboard.owner.id}/agent/credential/apply`,
+                        )
+                      }
+                      type="button"
+                    >
+                      {busy === "apply" ? (
+                        <LoaderCircle className="spin" size={17} />
+                      ) : (
+                        <FileCheck2 size={17} />
+                      )}
+                      申领智能体身份凭证
+                    </button>
+                  ) : dashboard.credential.status === "ACTIVE" ? (
+                    <button
+                      className="danger-button"
+                      disabled={busy === "status"}
+                      onClick={() =>
+                        mutate(
+                          "status",
+                          `/api/agents/${dashboard.agent.id}/credential/simulate-status`,
+                          {
+                            method: "POST",
+                            body: JSON.stringify({ status: "REVOKED" }),
+                          },
+                        )
+                      }
+                      type="button"
+                    >
+                      <LockKeyhole size={17} />
+                      模拟吊销
+                    </button>
+                  ) : (
+                    <button
+                      className="primary-button"
+                      disabled={busy === "status"}
+                      onClick={() =>
+                        mutate(
+                          "status",
+                          `/api/agents/${dashboard.agent.id}/credential/simulate-status`,
+                          {
+                            method: "POST",
+                            body: JSON.stringify({ status: "ACTIVE" }),
+                          },
+                        )
+                      }
+                      type="button"
+                    >
+                      <ShieldCheck size={17} />
+                      恢复有效
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="credential-timeline">
+                <div className="view-heading compact-heading">
+                  <div>
+                    <span className="section-kicker">ISSUANCE TRACE</span>
+                    <h2>申领与签发轨迹</h2>
+                  </div>
+                </div>
+                {dashboard.credentialEvents.length ? (
+                  <ol>
+                    {dashboard.credentialEvents.map((event, index) => (
+                      <li key={event.id}>
+                        <span className="timeline-index">
+                          {String(index + 1).padStart(2, "0")}
+                        </span>
+                        <div>
+                          <strong>
+                            {stepLabels[event.step] ?? event.step}
+                          </strong>
+                          <p>{event.detail}</p>
+                          <time>{formatTime(event.createdAt, true)}</time>
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <div className="empty-timeline">
+                    <Fingerprint size={28} />
+                    <strong>等待凭证申领</strong>
+                    <span>主人 DID 已就绪，尚未创建 AIC 和 VC。</span>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
+
+          {activeTab === "actions" && (
+            <section className="content-view action-view">
+              <div className="view-heading">
+                <div>
+                  <span className="section-kicker">AUDIT TRAIL</span>
+                  <h2>智能体行为记录</h2>
+                </div>
+                <p>共 {dashboard.actions.length} 条可追溯记录</p>
+              </div>
+              <div className="segmented-control" aria-label="筛选行为记录">
+                {[
+                  ["all", "全部"],
+                  ["outgoing", "我的智能体"],
+                  ["incoming", "影响我的农场"],
+                  ["blocked", "准入拦截"],
+                ].map(([key, label]) => (
+                  <button
+                    className={actionFilter === key ? "active" : ""}
+                    key={key}
+                    onClick={() => setActionFilter(key as ActionFilter)}
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="action-table">
+                <div className="action-table-head">
+                  <span>时间与行为</span>
+                  <span>目标</span>
+                  <span>凭证校验</span>
+                  <span>结果与追踪号</span>
+                </div>
+                {filteredActions.length ? (
+                  filteredActions.map((action) => (
+                    <article
+                      className={`action-row ${
+                        action.status === "BLOCKED" ? "action-blocked" : ""
+                      }`}
+                      key={action.id}
+                    >
+                      <div className="action-main">
+                        <span className="action-icon">
+                          <ActionIcon type={action.actionType} />
+                        </span>
+                        <div>
+                          <strong>
+                            {action.isIncoming
+                              ? `${action.agentName}影响了我的农场`
+                              : (actionLabels[action.actionType] ??
+                                action.actionType)}
+                          </strong>
+                          <time>{formatTime(action.createdAt, true)}</time>
+                        </div>
+                      </div>
+                      <div>
+                        <span className="mobile-label">目标</span>
+                        <strong>{action.targetOwnerName}</strong>
+                        <small>
+                          {action.cropName
+                            ? `${action.cropName} × ${action.quantity}`
+                            : "身份与状态检查"}
+                        </small>
+                      </div>
+                      <div>
+                        <span className="mobile-label">凭证校验</span>
+                        <CredentialBadge status={action.credentialStatus} />
+                        <small>{action.reason}</small>
+                      </div>
+                      <div>
+                        <span className="mobile-label">结果</span>
+                        <strong
+                          className={
+                            action.status === "BLOCKED"
+                              ? "result-blocked"
+                              : "result-success"
+                          }
+                        >
+                          {action.status === "BLOCKED" ? "已拦截" : "已完成"}
+                        </strong>
+                        <small>{action.traceId}</small>
+                      </div>
+                    </article>
+                  ))
+                ) : (
+                  <div className="empty-actions">
+                    <History size={26} />
+                    <span>当前筛选条件下暂无行为记录</span>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
+        </>
+      )}
+    </main>
+  );
+}
