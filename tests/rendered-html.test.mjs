@@ -49,9 +49,21 @@ test("keeps runtime provenance visible in the client dashboard", async () => {
   assert.match(demo, /确定性规则模式/);
   assert.match(demo, /MODEL_DECISION/);
   assert.match(demo, /source-chip/);
+  assert.match(demo, /中移接口准入有效/);
+  assert.match(demo, /申领凭证并加入协作/);
+  assert.doesNotMatch(demo, /未发现测试凭证|NOT_FOUND/);
+  assert.match(demo, /重新校验中移接口/);
+  assert.match(demo, /admissionMode/);
   assert.match(css, /\.runtime-state/);
   assert.match(css, /\.source-llm/);
+  assert.match(css, /\.admission-status/);
+  assert.match(css, /\.admission-demo_connected/);
   assert.match(readme, /AGENT_RUNTIME_MODE=llm/);
+  assert.match(readme, /CMCC_ADMISSION_MODE=demo/);
+  assert.match(
+    readme,
+    /CMCC_ADMISSION_AGENT_MAPPINGS=agent-sprout:agent1,agent-nova:agent2,agent-orbit:agent3/,
+  );
   assert.match(requirements, /langgraph/);
   assert.match(requirements, /langchain-deepseek/);
 });

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from .admission import CmccAdmissionVerifier
 from .agent_runtime import AgentRunInProgressError, AgentRuntime
 from .config import settings
 from .credentials import CredentialService
@@ -22,7 +23,8 @@ from .serializers import dashboard, serialize_owner
 
 
 credential_service = CredentialService()
-game_engine = GameEngine(credential_service)
+admission_verifier = CmccAdmissionVerifier()
+game_engine = GameEngine(credential_service, admission_verifier)
 agent_runtime = AgentRuntime(game_engine)
 logger = logging.getLogger(__name__)
 scheduled_tasks: dict[str, asyncio.Task[None]] = {}
@@ -115,6 +117,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "provider": credential_service.provider.name,
+        "admission": admission_verifier.descriptor(),
         "schedulerIntervalSeconds": settings.scheduler_interval_seconds,
         "agentRuntime": runtime_descriptor(),
     }
@@ -158,8 +161,60 @@ def apply_credential(owner_id: str, db: Session = Depends(get_db)) -> dict:
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if admission_verifier.applies_to(owner.agent.id):
+        admission_verifier.clear(owner.agent.id)
+        admission = admission_verifier.verify(owner.agent.id, force=True)
+        owner.agent.automation_enabled = admission.allowed
+        db.commit()
     db.expire_all()
     return dashboard(db, owner_id)
+
+
+def _load_admission_agent(agent_id: str, db: Session) -> Agent:
+    agent = db.scalar(
+        select(Agent)
+        .where(Agent.id == agent_id)
+        .options(selectinload(Agent.credential))
+    )
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+def _admission_payload(agent: Agent, *, force: bool) -> dict:
+    credential_status = (
+        agent.credential.status if agent.credential is not None else "MISSING"
+    )
+    if credential_status != "ACTIVE":
+        payload = admission_verifier.snapshot(agent.id).as_dict()
+        payload.update(
+            {
+                "allowed": False,
+                "mode": "DENIED",
+                "upstreamStatus": f"LOCAL_{credential_status}",
+                "message": f"本地凭证状态为 {credential_status}，未调用中移准入接口",
+                "cached": True,
+            }
+        )
+        return payload
+    decision = (
+        admission_verifier.verify(agent.id, force=True)
+        if force
+        else admission_verifier.snapshot(agent.id)
+    )
+    return decision.as_dict()
+
+
+@app.get("/api/agents/{agent_id}/admission")
+def get_agent_admission(agent_id: str, db: Session = Depends(get_db)) -> dict:
+    agent = _load_admission_agent(agent_id, db)
+    return _admission_payload(agent, force=False)
+
+
+@app.post("/api/agents/{agent_id}/admission/verify")
+def verify_agent_admission(agent_id: str, db: Session = Depends(get_db)) -> dict:
+    agent = _load_admission_agent(agent_id, db)
+    return _admission_payload(agent, force=True)
 
 
 @app.post("/api/agents/{agent_id}/run")
@@ -232,4 +287,5 @@ def simulate_credential_status(
 def reset(db: Session = Depends(get_db)) -> dict:
     with game_engine.lock:
         reset_demo(db)
+        admission_verifier.clear()
     return {"status": "reset", "defaultOwnerId": "owner-lin"}

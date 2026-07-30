@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from .admission import CmccAdmissionVerifier
 from .credentials import CredentialService
 from .models import Agent, AgentAction, Farm, Inventory, Plot, utcnow
 
@@ -42,8 +43,13 @@ class SkillOutcome:
 class GameEngine:
     """Deterministic farm rules and the only write path exposed to agent Skills."""
 
-    def __init__(self, credential_service: CredentialService) -> None:
+    def __init__(
+        self,
+        credential_service: CredentialService,
+        admission_verifier: CmccAdmissionVerifier | None = None,
+    ) -> None:
         self.credential_service = credential_service
+        self.admission_verifier = admission_verifier or CmccAdmissionVerifier()
         self.lock = threading.RLock()
 
     @staticmethod
@@ -60,8 +66,8 @@ class GameEngine:
             db.flush()
         return item
 
-    @staticmethod
     def _record(
+        self,
         db: Session,
         *,
         agent: Agent,
@@ -79,6 +85,9 @@ class GameEngine:
         run_id: str | None = None,
     ) -> AgentAction:
         after_state = dict(after or {})
+        admission = self.admission_verifier.snapshot(agent.id)
+        after_state.setdefault("admissionMode", admission.mode)
+        after_state.setdefault("admissionUpstreamStatus", admission.upstream_status)
         if run_id:
             after_state["agentRunId"] = run_id
         action = AgentAction(
@@ -144,16 +153,48 @@ class GameEngine:
     ) -> tuple[str, AgentAction | None]:
         credential_status, _ = self.credential_service.verify(db, agent)
         if credential_status == "ACTIVE":
-            return credential_status, None
+            admission = self.admission_verifier.verify(agent.id)
+            if admission.allowed:
+                return credential_status, None
+            blocked = self._record(
+                db,
+                agent=agent,
+                target_owner_id=agent.owner_id,
+                action_type="ACCESS",
+                status="BLOCKED",
+                reason=admission.message,
+                credential_status="REJECTED",
+                source=source,
+                after={
+                    "admissionMode": admission.mode,
+                    "admissionUpstreamStatus": admission.upstream_status,
+                },
+                run_id=run_id,
+            )
+            return "REJECTED", blocked
+        uses_cmcc_admission = self.admission_verifier.applies_to(agent.id)
+        admission_mode = "DENIED" if uses_cmcc_admission else "LOCAL"
+        admission_status = (
+            f"LOCAL_{credential_status}"
+            if uses_cmcc_admission
+            else credential_status
+        )
+        reason = self._credential_reason(credential_status)
+        if uses_cmcc_admission and credential_status == "MISSING":
+            reason = "尚未申领中移互联网智能体身份凭证，不能参与农场协作"
         blocked = self._record(
             db,
             agent=agent,
             target_owner_id=agent.owner_id,
             action_type="ACCESS",
             status="BLOCKED",
-            reason=self._credential_reason(credential_status),
+            reason=reason,
             credential_status=credential_status,
             source=source,
+            after={
+                "admissionMode": admission_mode,
+                "admissionUpstreamStatus": admission_status,
+            },
             run_id=run_id,
         )
         return credential_status, blocked

@@ -118,13 +118,48 @@ class CmccCrypto:
         return digest.upper()
 
     @staticmethod
-    def encrypt_phone_ecb(phone: str, app_key: str) -> str:
-        key = hashlib.md5(app_key.encode("utf-8")).digest()
+    def _aes_key(app_key: str, key_mode: str) -> bytes:
+        if key_mode == "md5":
+            return hashlib.md5(app_key.encode("utf-8")).digest()
+        if key_mode == "direct":
+            key = app_key.encode("utf-8")
+            if len(key) not in (16, 24, 32):
+                raise ValueError("Direct AES key must be 16, 24, or 32 UTF-8 bytes")
+            return key
+        raise ValueError(f"Unsupported AES key mode: {key_mode}")
+
+    @classmethod
+    def encrypt_aes_ecb(
+        cls,
+        value: str,
+        app_key: str,
+        key_mode: str = "md5",
+    ) -> str:
+        key = cls._aes_key(app_key, key_mode)
         padder = padding.PKCS7(algorithms.AES.block_size).padder()
-        padded = padder.update(phone.encode("utf-8")) + padder.finalize()
+        padded = padder.update(value.encode("utf-8")) + padder.finalize()
         encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
         encrypted = encryptor.update(padded) + encryptor.finalize()
         return base64.b64encode(encrypted).decode("ascii")
+
+    @classmethod
+    def encrypt_phone_ecb(cls, phone: str, app_key: str) -> str:
+        return cls.encrypt_aes_ecb(phone, app_key, key_mode="md5")
+
+    @classmethod
+    def decrypt_aes_ecb(
+        cls,
+        value: str,
+        app_key: str,
+        key_mode: str = "md5",
+    ) -> str:
+        key = cls._aes_key(app_key, key_mode)
+        encrypted = base64.b64decode(value, validate=True)
+        decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+        padded = decryptor.update(encrypted) + decryptor.finalize()
+        unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+        plain = unpadder.update(padded) + unpadder.finalize()
+        return plain.decode("utf-8")
 
 
 class CmccCredentialProvider:
@@ -168,8 +203,10 @@ class CmccCredentialProvider:
     def create_agent(self, owner: Owner, agent: Agent) -> CreatedAgentIdentity:
         body = {
             **self._base_body(),
-            "phoneNo": CmccCrypto.encrypt_phone_ecb(
-                settings.cmcc_demo_phone, settings.cmcc_app_key
+            "phoneNo": CmccCrypto.encrypt_aes_ecb(
+                settings.cmcc_demo_phone,
+                settings.cmcc_app_key,
+                key_mode="direct",
             ),
             "templateId": settings.cmcc_agent_template_id,
             "clawId": agent.claw_id,

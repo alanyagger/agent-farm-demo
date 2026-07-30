@@ -90,7 +90,7 @@ def reset_demo(db: Session) -> None:
             claw_id=record["claw_id"],
             platform_name="Agent Farm Web",
             description=record["description"],
-            automation_enabled=index < 2,
+            automation_enabled=False,
         )
         farm = Farm(
             id=f"farm-{index + 1}",
@@ -179,3 +179,12 @@ def reset_demo(db: Session) -> None:
 def ensure_seeded(db: Session) -> None:
     if db.scalar(select(Owner.id).limit(1)) is None:
         reset_demo(db)
+        return
+
+    # Backend restarts always return the two pre-issued demo agents to a quiet
+    # state. They can still be run manually or re-enabled from the dashboard.
+    for agent in db.scalars(
+        select(Agent).where(Agent.id.in_(("agent-sprout", "agent-orbit")))
+    ):
+        agent.automation_enabled = False
+    db.commit()

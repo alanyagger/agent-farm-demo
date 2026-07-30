@@ -2,7 +2,7 @@
 
 一个用于演示“智能体身份可归属、无有效凭证不能执行、行为全程可追溯”的单机 Web Demo。
 
-项目预置三组主人、智能体和农场。两个智能体持有有效的中移互联网智能体身份模拟凭证，第三个尚未申领。默认使用可离线演示的确定性规则；启用 LLM 模式后，智能体会通过 DeepSeek 和受限农场 Skills 决策种植、收获和社交采摘。每次行动都会先进行凭证准入校验并生成审计记录。
+项目预置三组主人、智能体和农场。两个智能体持有有效的中移互联网智能体身份模拟凭证，第三个尚未申领。青芽额外映射到中移外部身份 `agent1`，每轮行动前通过只读接口验证联调准入。默认使用可离线演示的确定性规则；启用 LLM 模式后，智能体会通过 DeepSeek 和受限农场 Skills 决策种植、收获和社交采摘。
 
 ## 项目结构
 
@@ -100,18 +100,47 @@ Get-CimInstance Win32_Process |
 | --- | --- | --- | --- |
 | 林晓 | 青芽 | ACTIVE | 自动种植、收获、邻居采摘 |
 | 周晴 | 禾光 | ACTIVE | 自动种植、收获、邻居采摘 |
-| 陈屿 | 田小诺 | MISSING | 演示准入拒绝和完整申领链路 |
+| 陈屿 | 田小诺 | MISSING | 手动申领后通过中移接口加入协作 |
 
 右上角重置按钮会恢复以上初始数据。
 
 ## 核心规则
 
-1. 每次行动前调用统一 `CredentialProvider` 校验智能体凭证。
-2. 只有 `ACTIVE` 状态可以进入游戏规则引擎。
+1. 每次行动前先通过统一 `CredentialProvider` 校验本地凭证。
+2. 三个智能体均映射到中移身份，行动前必须通过只读中移准入校验。
 3. 规则顺序为：收获一块成熟作物、补种最多两块空地、采摘一块邻居成熟作物。
 4. 同一智能体对邻居采摘有 18 秒冷却时间，且至少为主人保留一份产量。
 5. `PENDING`、`REVOKED`、`EXPIRED`、`REJECTED` 和无凭证状态均生成 `BLOCKED` 审计记录。
 6. LLM 模式中，每轮最多收获 1 次、种植 2 次、社交采摘 1 次；每个写 Skill 会再次核验凭证。
+
+## 中移联调演示准入
+
+当前演示不依赖现场创建或签发测试凭证。保持 `CREDENTIAL_PROVIDER=mock`，配置以下只读准入参数：
+
+```dotenv
+CMCC_BASE_URL=https://vctest.cmccsign.com
+CMCC_APP_ID=测试环境appId
+CMCC_APP_KEY=测试环境appKey
+CMCC_CLIENT_SECRET=测试环境clientSecret
+CMCC_AGENT_TEMPLATE_ID=341kv2bl96zpb925h1qqk2q687zz2zpv
+CMCC_DEMO_PHONE=测试手机号
+
+CMCC_ADMISSION_MODE=demo
+CMCC_ADMISSION_AGENT_MAPPINGS=agent-sprout:agent1,agent-nova:agent2,agent-orbit:agent3
+CMCC_ADMISSION_TIMEOUT_SECONDS=3
+CMCC_ADMISSION_CACHE_SECONDS=10
+```
+
+`demo` 模式会真实调用 `/api/cmvc-tocp-server/open-api/vc/listByTemplateId`：
+
+- 青芽使用外部身份 `agent1`，田小诺使用外部身份 `agent2`，禾光使用外部身份 `agent3`，三者分别查询和缓存。
+- 田小诺初始未申领；页面手动申领后会立即执行中移准入校验，通过后自动加入农场协作。
+- 青芽和禾光在启动及重置后默认暂停，可手动运行一次或开启自动运行。
+- 查询到对应智能体且凭证状态为 `2`：以 `REAL_ACTIVE` 真实准入。
+- 接口成功但没有对应智能体记录：以 `DEMO_CONNECTED` 联调演示准入。
+- HTTP、网络、签名或业务错误：以 `DENIED` 拒绝进入农场。
+
+可将 `CMCC_ADMISSION_MODE` 改为 `strict`，此时必须查询到真实有效记录；设为 `off` 则恢复完全本地门禁。GET `/api/agents/{agentId}/admission` 只读取内存缓存，不访问中移；POST `/api/agents/{agentId}/admission/verify` 会强制重新查询。普通 Dashboard 加载和主人切换不会等待外部接口。
 
 ## 凭证适配器
 
@@ -127,7 +156,29 @@ Get-CimInstance Win32_Process |
 - `/api/cmvc-tocp-server/open-api/vc/agent/issue`
 - `/api/cmvc-tocp-server/open-api/vc/listByTemplateId`
 
-通过 `.env` 将 `CREDENTIAL_PROVIDER` 设为 `cmcc` 并补齐中移测试参数即可启用。真实手机号仅从运行环境读取，不写入数据库和前端。
+`CmccCredentialProvider` 用于后续完整创建、签发联调，不是当前演示准入的必需条件。真实手机号仅从运行环境读取，不写入数据库和前端。
+
+在启用真实 Provider 前，先执行只读查询诊断。该命令只查询测试环境中已有的智能体凭证，不创建、签发或修改数据库，输出中的手机号和凭证记录 ID 均会脱敏：
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.tools.cmcc_credential_probe `
+  --base-url https://vctest.cmccsign.com `
+  --template-id 341kv2bl96zpb925h1qqk2q687zz2zpv `
+  --agent-name agent1
+```
+
+工具默认拒绝生产域名，避免误将联调请求发送到生产环境。
+
+需要继续完整联调时，才使用一次性创建与签发工具。该工具只允许测试域名，并在 `.logs` 保存不含手机号和密钥的阶段回执，防止网络中断后误创建重复凭证：
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.tools.cmcc_agent_issue `
+  --base-url https://vctest.cmccsign.com `
+  --template-id 341kv2bl96zpb925h1qqk2q687zz2zpv `
+  --agent-name agent1 `
+  --claw-id agent1 `
+  --confirm-create-and-issue
+```
 
 ## 验证
 

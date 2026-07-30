@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     cmcc_client_secret: str = ""
     cmcc_agent_template_id: str = ""
     cmcc_demo_phone: str = ""
+    cmcc_admission_mode: str = "demo"
+    cmcc_admission_agent_mappings: str = ""
+    # Used as the primary mapping by older .env files.
+    cmcc_admission_agent_id: str = "agent-sprout"
+    cmcc_admission_agent_name: str = "agent1"
+    cmcc_admission_timeout_seconds: float = 3.0
+    cmcc_admission_cache_seconds: float = 10.0
 
     model_config = SettingsConfigDict(
         env_file=".env",

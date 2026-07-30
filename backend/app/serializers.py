@@ -91,6 +91,10 @@ def serialize_action(action: AgentAction, owner_id: str, db: Session) -> dict:
         "beforeState": json.loads(action.before_state or "{}"),
         "afterState": after_state,
         "agentRunId": after_state.get("agentRunId"),
+        "admissionMode": after_state.get("admissionMode", "LOCAL"),
+        "admissionUpstreamStatus": after_state.get(
+            "admissionUpstreamStatus", "LOCAL"
+        ),
         "createdAt": iso(action.created_at),
     }
 
