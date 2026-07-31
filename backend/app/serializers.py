@@ -86,7 +86,13 @@ def serialize_action(action: AgentAction, owner_id: str, db: Session) -> dict:
         "cropName": CROPS.get(action.crop_type or "", {}).get("name"),
         "quantity": action.quantity,
         "source": action.source,
-        "executionMode": "LLM" if action.source.startswith("LLM_") else "RULES",
+        "executionMode": (
+            "OPENCLAW"
+            if action.source == "OPENCLAW"
+            else "LLM"
+            if action.source.startswith("LLM_")
+            else "RULES"
+        ),
         "isIncoming": is_incoming,
         "beforeState": json.loads(action.before_state or "{}"),
         "afterState": after_state,

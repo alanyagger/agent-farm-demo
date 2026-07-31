@@ -1347,6 +1347,12 @@ button:focus-visible {
   background: #f1f4fd;
 }
 
+.source-openclaw {
+  border-color: #9bcfd0;
+  color: #075b5d;
+  background: #e8f7f6;
+}
+
 .admission-chip {
   min-height: 19px;
   margin: 7px 0 0 5px;

@@ -26,13 +26,18 @@ class Settings(BaseSettings):
     cmcc_client_secret: str = ""
     cmcc_agent_template_id: str = ""
     cmcc_demo_phone: str = ""
-    cmcc_admission_mode: str = "demo"
+    cmcc_admission_mode: str = "off"
     cmcc_admission_agent_mappings: str = ""
     # Used as the primary mapping by older .env files.
     cmcc_admission_agent_id: str = "agent-sprout"
     cmcc_admission_agent_name: str = "agent1"
     cmcc_admission_timeout_seconds: float = 3.0
     cmcc_admission_cache_seconds: float = 10.0
+
+    openclaw_farm_enabled: bool = False
+    openclaw_farm_token: str = ""
+    openclaw_farm_run_ttl_seconds: int = 300
+    openclaw_model_label: str = "deepseek/deepseek-v4-pro"
 
     model_config = SettingsConfigDict(
         env_file=".env",

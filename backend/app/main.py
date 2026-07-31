@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -17,7 +19,15 @@ from .database import Base, SessionLocal, engine, get_db
 from .game import GameEngine
 from .model_provider import runtime_descriptor
 from .models import Agent, Owner
-from .schemas import AutomationRequest, SimulateCredentialStatusRequest
+from .openclaw_runtime import OpenClawRunError, OpenClawRunService
+from .schemas import (
+    AutomationRequest,
+    OpenClawFinishRequest,
+    OpenClawPlantRequest,
+    OpenClawPlotRequest,
+    OpenClawRunRequest,
+    SimulateCredentialStatusRequest,
+)
 from .seed import ensure_seeded, reset_demo
 from .serializers import dashboard, serialize_owner
 
@@ -26,8 +36,10 @@ credential_service = CredentialService()
 admission_verifier = CmccAdmissionVerifier()
 game_engine = GameEngine(credential_service, admission_verifier)
 agent_runtime = AgentRuntime(game_engine)
+openclaw_runtime = OpenClawRunService(game_engine, agent_runtime)
 logger = logging.getLogger(__name__)
 scheduled_tasks: dict[str, asyncio.Task[None]] = {}
+openclaw_bearer = HTTPBearer(auto_error=False)
 
 
 def _enabled_agent_ids() -> list[str]:
@@ -60,6 +72,7 @@ def _forget_scheduled_task(agent_id: str, task: asyncio.Task[None]) -> None:
 async def scheduler_loop() -> None:
     while True:
         await asyncio.sleep(settings.scheduler_interval_seconds)
+        await asyncio.to_thread(_expire_openclaw_runs)
         agent_ids = await asyncio.to_thread(_enabled_agent_ids)
         for agent_id in agent_ids:
             current = scheduled_tasks.get(agent_id)
@@ -77,11 +90,17 @@ async def scheduler_loop() -> None:
             )
 
 
+def _expire_openclaw_runs() -> None:
+    with SessionLocal() as db:
+        openclaw_runtime.expire_runs(db)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         ensure_seeded(db)
+        openclaw_runtime.recover_interrupted_runs(db)
     scheduler = asyncio.create_task(scheduler_loop())
     try:
         yield
@@ -120,7 +139,184 @@ def health() -> dict:
         "admission": admission_verifier.descriptor(),
         "schedulerIntervalSeconds": settings.scheduler_interval_seconds,
         "agentRuntime": runtime_descriptor(),
+        "openClaw": {
+            "enabled": settings.openclaw_farm_enabled,
+            "configured": bool(settings.openclaw_farm_token),
+            "runTtlSeconds": settings.openclaw_farm_run_ttl_seconds,
+        },
     }
+
+
+def require_openclaw(
+    credentials: HTTPAuthorizationCredentials | None = Depends(openclaw_bearer),
+) -> None:
+    if not settings.openclaw_farm_enabled:
+        raise HTTPException(status_code=503, detail="OpenClaw 农场接口未启用")
+    if not settings.openclaw_farm_token:
+        raise HTTPException(status_code=503, detail="OpenClaw 农场 Token 尚未配置")
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not secrets.compare_digest(
+            credentials.credentials,
+            settings.openclaw_farm_token,
+        )
+    ):
+        raise HTTPException(status_code=401, detail="OpenClaw 农场 Token 无效")
+
+
+def _openclaw_error(exc: OpenClawRunError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@app.get("/api/openclaw/agents", dependencies=[Depends(require_openclaw)])
+def list_openclaw_agents(db: Session = Depends(get_db)) -> dict:
+    return openclaw_runtime.list_agents(db)
+
+
+@app.post("/api/openclaw/runs", dependencies=[Depends(require_openclaw)])
+def begin_openclaw_run(
+    request: OpenClawRunRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return openclaw_runtime.begin(
+            db,
+            agent_id=request.agent_id,
+            instruction=request.instruction,
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.get(
+    "/api/openclaw/runs/{run_id}/farm",
+    dependencies=[Depends(require_openclaw)],
+)
+def inspect_openclaw_farm(run_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return openclaw_runtime.call_tool(
+            db,
+            run_id=run_id,
+            tool_name="inspect_my_farm",
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.get(
+    "/api/openclaw/runs/{run_id}/neighbors",
+    dependencies=[Depends(require_openclaw)],
+)
+def inspect_openclaw_neighbors(
+    run_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return openclaw_runtime.call_tool(
+            db,
+            run_id=run_id,
+            tool_name="inspect_neighbors",
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.get(
+    "/api/openclaw/runs/{run_id}/actions",
+    dependencies=[Depends(require_openclaw)],
+)
+def inspect_openclaw_actions(run_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return openclaw_runtime.call_tool(
+            db,
+            run_id=run_id,
+            tool_name="read_recent_actions",
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.post(
+    "/api/openclaw/runs/{run_id}/harvest",
+    dependencies=[Depends(require_openclaw)],
+)
+def harvest_openclaw_crop(
+    run_id: str,
+    request: OpenClawPlotRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return openclaw_runtime.call_tool(
+            db,
+            run_id=run_id,
+            tool_name="harvest_crop",
+            arguments={"plot_id": request.plot_id},
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.post(
+    "/api/openclaw/runs/{run_id}/plant",
+    dependencies=[Depends(require_openclaw)],
+)
+def plant_openclaw_crop(
+    run_id: str,
+    request: OpenClawPlantRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return openclaw_runtime.call_tool(
+            db,
+            run_id=run_id,
+            tool_name="plant_crop",
+            arguments={
+                "plot_id": request.plot_id,
+                "crop_type": request.crop_type,
+            },
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.post(
+    "/api/openclaw/runs/{run_id}/steal",
+    dependencies=[Depends(require_openclaw)],
+)
+def steal_openclaw_crop(
+    run_id: str,
+    request: OpenClawPlotRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return openclaw_runtime.call_tool(
+            db,
+            run_id=run_id,
+            tool_name="steal_crop",
+            arguments={"plot_id": request.plot_id},
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
+
+
+@app.post(
+    "/api/openclaw/runs/{run_id}/finish",
+    dependencies=[Depends(require_openclaw)],
+)
+def finish_openclaw_run(
+    run_id: str,
+    request: OpenClawFinishRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return openclaw_runtime.finish(
+            db,
+            run_id=run_id,
+            summary=request.summary,
+        )
+    except OpenClawRunError as exc:
+        raise _openclaw_error(exc) from exc
 
 
 @app.get("/api/owners")
@@ -286,6 +482,7 @@ def simulate_credential_status(
 @app.post("/api/demo/reset")
 def reset(db: Session = Depends(get_db)) -> dict:
     with game_engine.lock:
+        openclaw_runtime.release_running_agents(db)
         reset_demo(db)
         admission_verifier.clear()
     return {"status": "reset", "defaultOwnerId": "owner-lin"}

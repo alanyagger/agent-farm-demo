@@ -19,6 +19,8 @@ os.environ["CREDENTIAL_PROVIDER"] = "mock"
 os.environ["SCHEDULER_INTERVAL_SECONDS"] = "3600"
 os.environ["CMCC_ADMISSION_MODE"] = "off"
 os.environ["AGENT_RUNTIME_MODE"] = "rules"
+os.environ["OPENCLAW_FARM_ENABLED"] = "true"
+os.environ["OPENCLAW_FARM_TOKEN"] = "test-openclaw-token"
 
 from fastapi.testclient import TestClient
 
@@ -37,6 +39,8 @@ from backend.tools.cmcc_agent_issue import (
     IssueConfig,
     create_and_issue_agent,
 )
+
+OPENCLAW_HEADERS = {"Authorization": "Bearer test-openclaw-token"}
 
 
 def test_credential_gate_and_full_demo_flow() -> None:
@@ -103,6 +107,151 @@ def test_seeded_agents_and_persistent_farm_state() -> None:
         after = response.json()["dashboard"]
         assert len(after["farm"]["plots"]) == 6
         assert after["farm"]["coins"] >= before_coins
+
+
+def test_openclaw_tools_use_mock_gate_and_record_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_cmcc_query(_agent_id: str):
+        raise AssertionError("Mock mode must never call the CMCC admission API")
+
+    monkeypatch.setattr(
+        main_module.admission_verifier,
+        "_query",
+        unexpected_cmcc_query,
+    )
+
+    with TestClient(app) as client:
+        client.post("/api/demo/reset")
+
+        assert client.get("/api/openclaw/agents").status_code == 401
+        agents = client.get(
+            "/api/openclaw/agents",
+            headers=OPENCLAW_HEADERS,
+        ).json()
+        assert agents["defaultAgentId"] == "agent-sprout"
+        assert [item["agentName"] for item in agents["agents"]] == [
+            "青芽",
+            "田小诺",
+            "禾光",
+        ]
+        nova = next(
+            item for item in agents["agents"] if item["agentId"] == "agent-nova"
+        )
+        assert nova["credentialStatus"] == "MISSING"
+        assert nova["available"] is False
+
+        blocked = client.post(
+            "/api/openclaw/runs",
+            headers=OPENCLAW_HEADERS,
+            json={"agentId": "agent-nova", "instruction": "种两块番茄"},
+        ).json()
+        assert blocked["ok"] is False
+        assert blocked["status"] == "BLOCKED"
+        assert blocked["credentialStatus"] == "MISSING"
+
+        applied = client.post(
+            "/api/owners/owner-chen/agent/credential/apply"
+        ).json()
+        assert applied["credential"]["provider"] == "mock"
+        assert applied["credential"]["status"] == "ACTIVE"
+
+        started = client.post(
+            "/api/openclaw/runs",
+            headers=OPENCLAW_HEADERS,
+            json={"agentId": "田小诺", "instruction": "种三块胡萝卜"},
+        ).json()
+        assert started["ok"] is True
+        assert started["allowed"] is True
+        run_id = started["runId"]
+
+        farm = client.get(
+            f"/api/openclaw/runs/{run_id}/farm",
+            headers=OPENCLAW_HEADERS,
+        ).json()
+        assert farm["ok"] is True
+        assert len(farm["result"]["farm"]["plots"]) == 6
+
+        for plot_id in ("farm-3-plot-1", "farm-3-plot-2"):
+            planted = client.post(
+                f"/api/openclaw/runs/{run_id}/plant",
+                headers=OPENCLAW_HEADERS,
+                json={"plotId": plot_id, "cropType": "CARROT"},
+            ).json()
+            assert planted["result"]["ok"] is True
+
+        quota_rejected = client.post(
+            f"/api/openclaw/runs/{run_id}/plant",
+            headers=OPENCLAW_HEADERS,
+            json={"plotId": "farm-3-plot-3", "cropType": "CARROT"},
+        ).json()
+        assert quota_rejected["result"]["ok"] is False
+        assert quota_rejected["result"]["status"] == "REJECTED"
+
+        finished = client.post(
+            f"/api/openclaw/runs/{run_id}/finish",
+            headers=OPENCLAW_HEADERS,
+            json={"summary": "已查看农场并按单轮额度种植两块胡萝卜。"},
+        ).json()
+        assert finished["run"]["status"] == "SUCCESS"
+        assert finished["run"]["toolCallCount"] == 4
+
+        dashboard = client.get("/api/owners/owner-chen/dashboard").json()
+        assert dashboard["recentRuns"][0]["runtimeMode"] == "OPENCLAW"
+        assert "种三块胡萝卜" in dashboard["recentRuns"][0]["decisionSummary"]
+        assert any(
+            action["executionMode"] == "OPENCLAW"
+            and action["source"] == "OPENCLAW"
+            for action in dashboard["actions"]
+        )
+
+
+def test_openclaw_write_rechecks_mock_credential() -> None:
+    with TestClient(app) as client:
+        client.post("/api/demo/reset")
+        started = client.post(
+            "/api/openclaw/runs",
+            headers=OPENCLAW_HEADERS,
+            json={"instruction": "种一块玉米"},
+        ).json()
+        run_id = started["runId"]
+
+        client.post(
+            "/api/agents/agent-sprout/credential/simulate-status",
+            json={"status": "REVOKED"},
+        )
+        blocked = client.post(
+            f"/api/openclaw/runs/{run_id}/plant",
+            headers=OPENCLAW_HEADERS,
+            json={"plotId": "farm-1-plot-3", "cropType": "CORN"},
+        ).json()
+        assert blocked["ok"] is False
+        assert blocked["run"]["status"] == "BLOCKED"
+        assert blocked["result"]["status"] == "BLOCKED"
+
+
+def test_demo_reset_releases_openclaw_agent_claim() -> None:
+    with TestClient(app) as client:
+        client.post("/api/demo/reset")
+        first = client.post(
+            "/api/openclaw/runs",
+            headers=OPENCLAW_HEADERS,
+            json={"instruction": "查看农场"},
+        ).json()
+        assert first["ok"] is True
+
+        assert client.post("/api/demo/reset").status_code == 200
+        second = client.post(
+            "/api/openclaw/runs",
+            headers=OPENCLAW_HEADERS,
+            json={"instruction": "再次查看农场"},
+        ).json()
+        assert second["ok"] is True
+        client.post(
+            f"/api/openclaw/runs/{second['runId']}/finish",
+            headers=OPENCLAW_HEADERS,
+            json={"summary": "重置后运行正常。"},
+        )
 
 
 def test_llm_runtime_uses_allow_listed_skills_and_records_audit(

@@ -85,7 +85,7 @@ type Action = {
   cropName: string | null;
   quantity: number;
   source: string;
-  executionMode: "LLM" | "RULES";
+  executionMode: "LLM" | "RULES" | "OPENCLAW";
   admissionMode: "REAL_ACTIVE" | "DEMO_CONNECTED" | "DENIED" | "LOCAL";
   admissionUpstreamStatus: string;
   agentRunId: string | null;
@@ -114,7 +114,7 @@ type Dashboard = {
   recentRuns: Array<{
     id: string;
     triggerSource: string;
-    runtimeMode: "LLM" | "RULES";
+    runtimeMode: "LLM" | "RULES" | "OPENCLAW";
     provider: string;
     model: string;
     status: string;
@@ -149,20 +149,6 @@ type Dashboard = {
   serverTime: string;
 };
 
-type Admission = {
-  agentId: string;
-  externalAgentName: string;
-  allowed: boolean;
-  mode: "REAL_ACTIVE" | "DEMO_CONNECTED" | "DENIED" | "LOCAL";
-  upstreamStatus: string;
-  message: string;
-  checkedAt: string | null;
-  cached: boolean;
-  environment: string;
-  templateId: string;
-  recordCount: number;
-};
-
 type TabKey = "farm" | "neighbors" | "credential" | "actions";
 type ActionFilter = "all" | "outgoing" | "incoming" | "blocked";
 
@@ -185,18 +171,11 @@ const actionLabels: Record<string, string> = {
   AGENT_ERROR: "模型运行异常",
 };
 
-const admissionLabels: Record<Admission["mode"], string> = {
-  REAL_ACTIVE: "中移真实凭证有效",
-  DEMO_CONNECTED: "中移接口准入有效",
-  DENIED: "中移准入未通过",
-  LOCAL: "本地 Demo 门禁",
-};
-
-const admissionShortLabels: Record<Admission["mode"], string> = {
-  REAL_ACTIVE: "中移真实",
-  DEMO_CONNECTED: "中移联调",
+const admissionShortLabels: Record<Action["admissionMode"], string> = {
+  REAL_ACTIVE: "外部凭证",
+  DEMO_CONNECTED: "接口联调",
   DENIED: "准入拒绝",
-  LOCAL: "本地门禁",
+  LOCAL: "Mock 门禁",
 };
 
 const stepLabels: Record<string, string> = {
@@ -350,7 +329,6 @@ export default function FarmDemo() {
   const [owners, setOwners] = useState<OwnerSummary[]>([]);
   const [selectedOwnerId, setSelectedOwnerId] = useState("owner-lin");
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
-  const [admission, setAdmission] = useState<Admission | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>("farm");
   const [actionFilter, setActionFilter] = useState<ActionFilter>("all");
   const [busy, setBusy] = useState<string | null>(null);
@@ -432,30 +410,6 @@ export default function FarmDemo() {
     };
   }, [loadDashboard, selectedOwnerId]);
 
-  const dashboardAgentId = dashboard?.agent.id;
-  useEffect(() => {
-    if (!dashboardAgentId) return;
-    let cancelled = false;
-    const loadAdmission = async () => {
-      try {
-        const data = await api<Admission>(
-          `/api/agents/${dashboardAgentId}/admission`,
-        );
-        if (!cancelled && selectedOwnerRef.current === dashboard?.owner.id) {
-          setAdmission(data);
-        }
-      } catch {
-        if (!cancelled) setAdmission(null);
-      }
-    };
-    void loadAdmission();
-    const timer = window.setInterval(loadAdmission, 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [dashboardAgentId, dashboard?.owner.id]);
-
   const selectOwner = (ownerId: string) => {
     dashboardRequestRef.current?.controller.abort();
     dashboardRequestRef.current = null;
@@ -463,7 +417,6 @@ export default function FarmDemo() {
     selectedOwnerRef.current = ownerId;
     setSelectedOwnerId(ownerId);
     setDashboard((current) => (current?.owner.id === ownerId ? current : null));
-    setAdmission(null);
     setError(null);
   };
 
@@ -514,7 +467,6 @@ export default function FarmDemo() {
       await api("/api/demo/reset", { method: "POST" });
       selectedOwnerRef.current = "owner-lin";
       setSelectedOwnerId("owner-lin");
-      setAdmission(null);
       setActiveTab("farm");
       await Promise.all([loadOwners(), loadDashboard(false, "owner-lin")]);
     } catch (requestError) {
@@ -526,32 +478,9 @@ export default function FarmDemo() {
     }
   };
 
-  const verifyAdmission = async () => {
-    if (!dashboard) return;
-    const ownerId = dashboard.owner.id;
-    setBusy("admission");
-    setError(null);
-    try {
-      const data = await api<Admission>(
-        `/api/agents/${dashboard.agent.id}/admission/verify`,
-        { method: "POST" },
-      );
-      if (selectedOwnerRef.current === ownerId) setAdmission(data);
-    } catch (requestError) {
-      if (selectedOwnerRef.current === ownerId) {
-        setError(
-          requestError instanceof Error ? requestError.message : "准入校验失败",
-        );
-      }
-    } finally {
-      setBusy(null);
-    }
-  };
-
   const applyCredential = async () => {
     if (!dashboard) return;
     const ownerId = dashboard.owner.id;
-    const agentId = dashboard.agent.id;
     setBusy("apply");
     setError(null);
     try {
@@ -559,12 +488,8 @@ export default function FarmDemo() {
         `/api/owners/${ownerId}/agent/credential/apply`,
         { method: "POST" },
       );
-      const nextAdmission = await api<Admission>(
-        `/api/agents/${agentId}/admission`,
-      );
       if (selectedOwnerRef.current === ownerId) {
         setDashboard(nextDashboard);
-        setAdmission(nextAdmission);
       }
       await loadOwners();
     } catch (requestError) {
@@ -578,12 +503,6 @@ export default function FarmDemo() {
     }
   };
 
-  const awaitingCmccCredential = Boolean(
-    dashboard &&
-      admission?.externalAgentName &&
-      !dashboard.credential,
-  );
-
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -593,7 +512,7 @@ export default function FarmDemo() {
           </div>
           <div>
             <h1>智耕凭证农场</h1>
-            <p>中移互联网智能体身份凭证 Demo</p>
+            <p>OpenClaw · Mock 凭证 Skill Demo</p>
           </div>
         </div>
 
@@ -851,9 +770,11 @@ export default function FarmDemo() {
                   )}
                   {dashboard.recentRuns[0] && (
                     <small className="latest-run-summary">
-                      {dashboard.recentRuns[0].runtimeMode === "LLM"
-                        ? `${dashboard.recentRuns[0].provider} · ${dashboard.recentRuns[0].model}`
-                        : "本地规则"}
+                      {dashboard.recentRuns[0].runtimeMode === "OPENCLAW"
+                        ? `OpenClaw · ${dashboard.recentRuns[0].model}`
+                        : dashboard.recentRuns[0].runtimeMode === "LLM"
+                          ? `${dashboard.recentRuns[0].provider} · ${dashboard.recentRuns[0].model}`
+                          : "本地规则"}
                       {" · "}
                       {dashboard.recentRuns[0].toolCallCount} 次 Skill 调用
                     </small>
@@ -958,90 +879,42 @@ export default function FarmDemo() {
                   </div>
                 </div>
 
-                {admission && (
-                  <div className={`admission-status admission-${admission.mode.toLowerCase()}`}>
-                    <div className="admission-heading">
-                      <div>
-                        <span>中移接口准入</span>
-                        <strong>
-                          {admission.externalAgentName
-                            ? `${dashboard.agent.name} → ${admission.externalAgentName}`
-                            : dashboard.agent.name}
-                        </strong>
-                      </div>
-                      <span className="admission-badge">
-                        {awaitingCmccCredential
-                          ? "等待申领"
-                          : admissionLabels[admission.mode]}
-                      </span>
+                <div className="admission-status admission-local">
+                  <div className="admission-heading">
+                    <div>
+                      <span>本地凭证门禁</span>
+                      <strong>{dashboard.agent.name}</strong>
                     </div>
-                    <div className="admission-details">
-                      <div>
-                        <span>环境</span>
-                        <strong>{admission.environment || "本地"}</strong>
-                      </div>
-                      {awaitingCmccCredential ? (
-                        <div>
-                          <span>接入状态</span>
-                          <strong>等待凭证申领</strong>
-                        </div>
-                      ) : admission.mode === "DEMO_CONNECTED" ? (
-                        <div>
-                          <span>校验结果</span>
-                          <strong>准入校验通过</strong>
-                        </div>
-                      ) : (
-                        <>
-                          <div>
-                            <span>上游状态</span>
-                            <strong>{admission.upstreamStatus}</strong>
-                          </div>
-                          <div>
-                            <span>记录数量</span>
-                            <strong>{admission.recordCount}</strong>
-                          </div>
-                        </>
-                      )}
-                      <div>
-                        <span>校验时间</span>
-                        <strong>
-                          {admission.checkedAt
-                            ? formatTime(admission.checkedAt, true)
-                            : "尚未校验"}
-                        </strong>
-                      </div>
-                    </div>
-                    <p>
-                      {awaitingCmccCredential
-                        ? "完成智能体身份凭证申领后，将进行中移接口准入校验。"
-                        : admission.mode === "DEMO_CONNECTED"
-                          ? "中移接口联调校验已完成，当前智能体已获得农场协作准入。"
-                          : admission.message}
-                    </p>
-                    {admission.templateId && (
-                      <small>模板：{shortId(admission.templateId)}</small>
-                    )}
+                    <span className="admission-badge">
+                      {dashboard.credential?.status === "ACTIVE"
+                        ? "Mock 校验通过"
+                        : "等待有效凭证"}
+                    </span>
                   </div>
-                )}
+                  <div className="admission-details">
+                    <div>
+                      <span>凭证 Provider</span>
+                      <strong>MockCredentialProvider</strong>
+                    </div>
+                    <div>
+                      <span>校验位置</span>
+                      <strong>本地数据库</strong>
+                    </div>
+                    <div>
+                      <span>当前状态</span>
+                      <strong>
+                        {statusLabels[
+                          dashboard.credential?.status ?? "MISSING"
+                        ]}
+                      </strong>
+                    </div>
+                  </div>
+                  <p>
+                    当前 Demo 使用本地 Mock 身份凭证完成智能体准入，不调用外部凭证接口。
+                  </p>
+                </div>
 
                 <div className="credential-actions">
-                  {admission?.externalAgentName &&
-                    admission.mode !== "LOCAL" &&
-                    dashboard.credential?.status === "ACTIVE" && (
-                      <button
-                        className="secondary-button"
-                        disabled={busy === "admission"}
-                        onClick={verifyAdmission}
-                        type="button"
-                      >
-                        {busy === "admission" ? (
-                          <LoaderCircle className="spin" size={17} />
-                        ) : (
-                          <RefreshCw size={17} />
-                        )}
-                        重新校验中移接口
-                      </button>
-                    )}
                   {!dashboard.credential ? (
                     <button
                       className="primary-button"
@@ -1054,9 +927,7 @@ export default function FarmDemo() {
                       ) : (
                         <FileCheck2 size={17} />
                       )}
-                      {admission?.externalAgentName
-                        ? "申领凭证并加入协作"
-                        : "申领智能体身份凭证"}
+                      申领智能体身份凭证
                     </button>
                   ) : dashboard.credential.status === "ACTIVE" ? (
                     <button
@@ -1205,7 +1076,11 @@ export default function FarmDemo() {
                         <span
                           className={`source-chip source-${action.executionMode.toLowerCase()}`}
                         >
-                          {action.executionMode === "LLM" ? "模型 Skill" : "规则引擎"}
+                          {action.executionMode === "OPENCLAW"
+                            ? "OpenClaw Skill"
+                            : action.executionMode === "LLM"
+                              ? "模型 Skill"
+                              : "规则引擎"}
                         </span>
                         <span
                           className={`admission-chip admission-${action.admissionMode.toLowerCase()}`}

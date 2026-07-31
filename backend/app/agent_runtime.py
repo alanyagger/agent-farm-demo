@@ -198,13 +198,13 @@ class AgentRuntime:
         with self._active_agents_lock:
             return agent_id in self._active_agents
 
-    def _claim_agent(self, agent_id: str) -> None:
+    def claim_agent(self, agent_id: str) -> None:
         with self._active_agents_lock:
             if agent_id in self._active_agents:
                 raise AgentRunInProgressError("该智能体已有一轮任务正在执行")
             self._active_agents.add(agent_id)
 
-    def _release_agent(self, agent_id: str) -> None:
+    def release_agent(self, agent_id: str) -> None:
         with self._active_agents_lock:
             self._active_agents.discard(agent_id)
 
@@ -246,7 +246,7 @@ class AgentRuntime:
     def run(self, db: Session, agent_id: str, source: str = "MANUAL") -> AgentExecutionResult:
         if db.get(Agent, agent_id) is None:
             raise ValueError("Agent not found")
-        self._claim_agent(agent_id)
+        self.claim_agent(agent_id)
         try:
             run = self._new_run(db, agent_id, source)
             if not settings.llm_runtime_enabled:
@@ -266,7 +266,7 @@ class AgentRuntime:
                 return AgentExecutionResult(run, actions)
             return self._run_llm(db, agent_id, source, run)
         finally:
-            self._release_agent(agent_id)
+            self.release_agent(agent_id)
 
     def _run_llm(
         self,
